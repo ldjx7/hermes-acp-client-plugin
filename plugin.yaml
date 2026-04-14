@@ -1,0 +1,22 @@
+name: acp-client
+version: 0.2.1
+description: ACP client for dispatching tasks to AI workers (Gemini/Claude/Codex/Qwen)
+provides_tools:
+  - acp_dispatch
+  - acp_progress
+  - acp_result
+  - acp_cancel
+  - acp_list
+  - acp_cleanup
+  - acp_shutdown
+requires_env:
+  - name: GOOGLE_API_KEY
+    description: Google API key for Gemini CLI (or OAuth via gemini login)
+    url: https://aistudio.google.com/app/apikey
+    secret: true
+  - name: OPENAI_API_KEY
+    description: OpenAI API key for Qwen CLI (optional, for Qwen worker)
+    url: https://platform.openai.com/api-keys
+    secret: true
+hooks:
+  pre_llm_call: acp.hooks.pre_llm_call_hook
