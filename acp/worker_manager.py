@@ -200,6 +200,19 @@ class WorkerManager:
             "workers": self.get_all_workers(),
         }
     
+    def get_available_models(self) -> Dict[str, Optional[str]]:
+        """
+        获取所有可用 Worker 的模型信息
+        
+        Returns:
+            字典 {worker_name: model_name}
+        """
+        return {
+            name: info.model 
+            for name, info in self._workers.items()
+            if info.status == WorkerStatus.AVAILABLE
+        }
+    
     def is_rate_limit_error(self, error_message: str) -> bool:
         """
         判断是否为速率限制错误
@@ -323,6 +336,7 @@ def get_worker_status() -> str:
     """获取 Worker 状态（用于工具调用）"""
     manager = get_worker_manager()
     summary = manager.get_status_summary()
+    summary["available_models"] = manager.get_available_models()
     return json.dumps(summary, indent=2, ensure_ascii=False)
 
 
