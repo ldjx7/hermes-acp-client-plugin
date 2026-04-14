@@ -7,8 +7,12 @@ from datetime import datetime
 from acp.transport import get_transport, initialize_transport, TransportError, RequestTimeoutError, shutdown_transport
 from acp.session_manager import get_session_manager, SessionStatus
 from acp.hooks import pre_llm_call_hook, register_hooks
+from acp.worker_manager import get_worker_manager, initialize_workers, WorkerStatus
 
 logger = logging.getLogger(__name__)
+
+# 初始化 Worker 管理器
+initialize_workers()
 
 # 全局配置
 DEFAULT_TIMEOUT = 120.0
@@ -82,11 +86,12 @@ def ensure_initialized(worker: str = "gemini", **kwargs) -> bool:
 
 
 def acp_dispatch(task: str, context: dict = None, worker: str = "gemini", 
-                 timeout: float = None, max_retries: int = None) -> str:
+                 timeout: float = None, max_retries: int = None, 
+                 auto_fallback: bool = True) -> str:
     """
     Handler for acp_dispatch tool.
     
-    派发任务到 ACP worker，支持多平台和错误重试。
+    派发任务到 ACP worker，支持多平台、错误重试和自动故障转移。
     
     Args:
         task: 任务描述
@@ -94,6 +99,7 @@ def acp_dispatch(task: str, context: dict = None, worker: str = "gemini",
         worker: worker 平台 (gemini/claude/codex)，默认 gemini
         timeout: 请求超时（秒）
         max_retries: 最大重试次数
+        auto_fallback: 是否自动故障转移（默认 True）
         
     Returns:
         JSON 字符串，包含 sessionId 和状态，或错误信息
@@ -106,60 +112,124 @@ def acp_dispatch(task: str, context: dict = None, worker: str = "gemini",
         if max_retries:
             config["max_retries"] = max_retries
         
-        if not ensure_initialized(worker=worker, **config):
+        worker_manager = get_worker_manager() if auto_fallback else None
+        exclude_workers = []
+        attempts = 0
+        effective_max_retries = max_retries or DEFAULT_MAX_RETRIES
+        
+        while attempts < effective_max_retries:
+            # 选择 Worker
+            current_worker = worker if attempts == 0 else None
+            if auto_fallback and worker_manager:
+                if not current_worker or current_worker in exclude_workers:
+                    current_worker = worker_manager.get_available_worker(exclude=exclude_workers)
+                    if not current_worker:
+                        return json.dumps({
+                            "error": "No available workers",
+                            "status": "failed",
+                            "worker_status": worker_manager.get_status_summary(),
+                        })
+            
+            # 初始化传输
+            if not ensure_initialized(worker=current_worker, **config):
+                if worker_manager:
+                    worker_manager.mark_offline(current_worker)
+                exclude_workers.append(current_worker)
+                attempts += 1
+                continue
+            
+            transport = get_transport(worker=current_worker)
+            manager = get_session_manager()
+            start_time = time.time()
+            
+            # 1. 创建会话
+            session_name = f"task_{int(time.time())}"
+            resp = transport.create_session(name=session_name)
+            
+            if not resp:
+                if worker_manager:
+                    worker_manager.mark_error(current_worker, "No response", is_rate_limit=False)
+                exclude_workers.append(current_worker)
+                attempts += 1
+                continue
+            
+            if "error" in resp:
+                error_msg = resp.get("error", {}).get("message", "Unknown error") if isinstance(resp.get("error"), dict) else str(resp.get("error"))
+                if worker_manager:
+                    is_rate_limit = worker_manager.is_rate_limit_error(error_msg)
+                    worker_manager.mark_error(current_worker, error_msg, is_rate_limit=is_rate_limit)
+                exclude_workers.append(current_worker)
+                attempts += 1
+                if is_rate_limit and auto_fallback:
+                    logger.warning(f"Rate limit on {current_worker}, trying next worker...")
+                    continue
+                return json.dumps({"error": error_msg, "status": "failed", "worker": current_worker})
+            
+            session_id = resp.get("result", {}).get("sessionId")
+            if not session_id:
+                if worker_manager:
+                    worker_manager.mark_error(current_worker, "No sessionId", is_rate_limit=False)
+                return json.dumps({"error": "No sessionId in response", "response": resp, "worker": current_worker})
+            
+            # 注册到管理器
+            manager.create_session(prompt=task, session_id=session_id)
+            logger.info(f"Created session {session_id} for worker {current_worker}")
+            
+            # 2. 发送提示
+            prompt = task
+            if context:
+                prompt += f"\n\nContext:\n{json.dumps(context, indent=2)}"
+            
+            resp = transport.send_prompt(session_id, prompt)
+            
+            if not resp:
+                manager.update_session(session_id, status=SessionStatus.FAILED, error="No response from worker")
+                if worker_manager:
+                    worker_manager.mark_error(current_worker, "No response", is_rate_limit=False)
+                return json.dumps({"error": "No response from worker", "sessionId": session_id, "status": "failed", "worker": current_worker})
+            
+            if "error" in resp:
+                error_msg = resp.get("error", {}).get("message", "Unknown error") if isinstance(resp.get("error"), dict) else str(resp.get("error"))
+                manager.update_session(session_id, status=SessionStatus.FAILED, error=error_msg)
+                if worker_manager:
+                    is_rate_limit = worker_manager.is_rate_limit_error(error_msg)
+                    worker_manager.mark_error(current_worker, error_msg, is_rate_limit=is_rate_limit)
+                if is_rate_limit and auto_fallback and attempts < effective_max_retries - 1:
+                    logger.warning(f"Rate limit on {current_worker}, retrying with different worker...")
+                    exclude_workers.append(current_worker)
+                    attempts += 1
+                    continue
+                return json.dumps({"error": error_msg, "sessionId": session_id, "status": "failed", "worker": current_worker})
+            
+            # 成功
+            response_time = time.time() - start_time
+            if worker_manager:
+                # 从响应中提取模型信息
+                model = None
+                if "result" in resp and "_meta" in resp["result"]:
+                    model_usage = resp["result"]["_meta"].get("model_usage", [])
+                    if model_usage:
+                        model = model_usage[0].get("model")
+                worker_manager.mark_success(current_worker, response_time, model)
+            
+            # 更新状态为运行中
+            manager.update_session(session_id, status=SessionStatus.RUNNING)
+            logger.info(f"Dispatched task to session {session_id} on {current_worker}")
+            
             return json.dumps({
-                "error": f"Failed to initialize ACP transport for {worker}", 
-                "status": "failed",
-                "worker": worker
+                "sessionId": session_id, 
+                "status": "dispatched",
+                "worker": current_worker,
+                "attempt": attempts + 1,
+                "timestamp": datetime.now().isoformat()
             })
         
-        transport = get_transport(worker=worker)
-        manager = get_session_manager()
-        
-        # 1. 创建会话
-        session_name = f"task_{int(time.time())}"
-        resp = transport.create_session(name=session_name)
-        
-        if not resp:
-            return json.dumps({"error": "No response from worker", "status": "failed"})
-        
-        if "error" in resp:
-            error_msg = resp.get("error", {}).get("message", "Unknown error") if isinstance(resp.get("error"), dict) else str(resp.get("error"))
-            return json.dumps({"error": error_msg, "status": "failed"})
-        
-        session_id = resp.get("result", {}).get("sessionId")
-        if not session_id:
-            return json.dumps({"error": "No sessionId in response", "response": resp})
-        
-        # 注册到管理器
-        manager.create_session(prompt=task, session_id=session_id)
-        logger.info(f"Created session {session_id} for worker {worker}")
-        
-        # 2. 发送提示
-        prompt = task
-        if context:
-            prompt += f"\n\nContext:\n{json.dumps(context, indent=2)}"
-        
-        resp = transport.send_prompt(session_id, prompt)
-        
-        if not resp:
-            manager.update_session(session_id, status=SessionStatus.FAILED, error="No response from worker")
-            return json.dumps({"error": "No response from worker", "sessionId": session_id, "status": "failed"})
-        
-        if "error" in resp:
-            error_msg = resp.get("error", {}).get("message", "Unknown error") if isinstance(resp.get("error"), dict) else str(resp.get("error"))
-            manager.update_session(session_id, status=SessionStatus.FAILED, error=error_msg)
-            return json.dumps({"error": error_msg, "sessionId": session_id, "status": "failed"})
-        
-        # 更新状态为运行中
-        manager.update_session(session_id, status=SessionStatus.RUNNING)
-        logger.info(f"Dispatched task to session {session_id}")
-        
+        # 所有尝试都失败
         return json.dumps({
-            "sessionId": session_id, 
-            "status": "dispatched",
-            "worker": worker,
-            "timestamp": datetime.now().isoformat()
+            "error": f"Failed after {attempts} attempts",
+            "status": "failed",
+            "attempted_workers": exclude_workers,
+            "worker_status": worker_manager.get_status_summary() if worker_manager else None,
         })
         
     except RequestTimeoutError as e:
@@ -390,4 +460,26 @@ def acp_shutdown(worker: str = None) -> str:
         })
     except Exception as e:
         logger.exception("Error in acp_shutdown")
+        return json.dumps({"error": str(e), "status": "error"})
+
+
+def acp_worker_status() -> str:
+    """
+    获取所有 Worker 的状态信息。
+    
+    返回每个 Worker 的：
+    - 状态（available/rate_limited/error/offline）
+    - 使用的模型
+    - 成功率
+    - 平均响应时间
+    - 速率限制重置时间
+    
+    Returns:
+        JSON 字符串，包含所有 Worker 的状态摘要
+    """
+    try:
+        from acp.worker_manager import get_worker_status
+        return get_worker_status()
+    except Exception as e:
+        logger.exception("Error in acp_worker_status")
         return json.dumps({"error": str(e), "status": "error"})

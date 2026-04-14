@@ -9,6 +9,7 @@ provides_tools:
   - acp_list
   - acp_cleanup
   - acp_shutdown
+  - acp_worker_status
 requires_env:
   - name: GOOGLE_API_KEY
     description: Google API key for Gemini CLI (or OAuth via gemini login)

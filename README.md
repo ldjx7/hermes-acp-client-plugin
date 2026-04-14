@@ -107,9 +107,13 @@ hermes-acp-client-plugin/
 
 | 工具 | 功能 | 参数 |
 |------|------|------|
-| `acp_dispatch` | 派发任务到 ACP worker | `task`, `worker`, `timeout` |
+| `acp_dispatch` | 派发任务到 ACP worker | `task`, `worker`, `timeout`, `auto_fallback` |
 | `acp_progress` | 查询任务进度 | `session_id` |
-| `acp_result` | 获取最终结果 | `session_id` |
+| `acp_result` | 获取最终结果 | `session_id`, `wait`, `timeout` |
+| `acp_worker_status` | **查询 Worker 状态** | - |
+| `acp_cancel` | 取消任务 | `session_id` |
+| `acp_list` | 列出会话 | `active_only` |
+| `acp_cleanup` | 清理旧会话 | `max_age_hours` |
 
 ### 工具调用示例
 

@@ -114,3 +114,8 @@ ACP_SHUTDOWN_SCHEMA = {
         }
     }
 }
+
+ACP_WORKER_STATUS_SCHEMA = {
+    "type": "object",
+    "properties": {}
+}
