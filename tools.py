@@ -206,10 +206,19 @@ def acp_dispatch(task: str, context: dict = None, worker: str = "gemini",
             if worker_manager:
                 # 从响应中提取模型信息
                 model = None
-                if "result" in resp and "_meta" in resp["result"]:
-                    model_usage = resp["result"]["_meta"].get("model_usage", [])
+                if "result" in resp:
+                    result = resp["result"]
+                    # 路径 1: result._meta.quota.model_usage
+                    quota = result.get("_meta", {}).get("quota", {})
+                    model_usage = quota.get("model_usage", [])
                     if model_usage:
                         model = model_usage[0].get("model")
+                    # 路径 2: result._meta.model_usage (备用)
+                    if not model:
+                        model_usage = result.get("_meta", {}).get("model_usage", [])
+                        if model_usage:
+                            model = model_usage[0].get("model")
+                
                 worker_manager.mark_success(current_worker, response_time, model)
             
             # 更新状态为运行中
