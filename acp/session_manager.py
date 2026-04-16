@@ -27,6 +27,7 @@ class SessionState:
     completed_at: Optional[datetime] = None
     prompt: Optional[str] = None
     metadata: Dict = field(default_factory=dict)
+    _event: threading.Event = field(default_factory=threading.Event, repr=False)
     
     def to_dict(self) -> Dict:
         return {
@@ -94,6 +95,8 @@ class SessionManager:
                 elif new_status in (SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED):
                     if not session.completed_at:
                         session.completed_at = datetime.now()
+                    # ✅ 触发事件，唤醒等待的线程
+                    session._event.set()
                 kwargs["status"] = new_status
             
             session.update(**kwargs)
@@ -105,7 +108,25 @@ class SessionManager:
                 del self._sessions[session_id]
                 return True
             return False
-
+    
+    def list_sessions(self, status_filter: SessionStatus = None) -> List[str]:
+        """
+        列出所有会话 ID（公开方法，不直接访问私有属性）。
+        
+        Args:
+            status_filter: 可选，按状态过滤
+        
+        Returns:
+            会话 ID 列表
+        """
+        with self._rlock:
+            if status_filter is None:
+                return list(self._sessions.keys())
+            return [
+                sid for sid, session in self._sessions.items()
+                if session.status == status_filter
+            ]
+    
     def get_progress(self, session_id: str) -> Optional[Dict]:
         session = self.get_session(session_id)
         if not session:
@@ -118,16 +139,23 @@ class SessionManager:
         }
 
     def wait_for_completion(self, session_id: str, timeout: float = None) -> SessionState:
-        start = time.time()
-        while True:
-            session = self.get_session(session_id)
-            if not session:
-                raise ValueError(f"Session {session_id} not found")
-            if session.status in (SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED):
-                return session
-            if timeout and (time.time() - start) > timeout:
-                return session
-            time.sleep(0.5)
+        """
+        等待会话完成，使用 Event.wait() 替代忙等待。
+        
+        Args:
+            session_id: 会话 ID
+            timeout: 超时时间（秒）
+        
+        Returns:
+            会话状态
+        """
+        session = self.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+        
+        # ✅ 使用 Event.wait() 替代忙等待
+        session._event.wait(timeout=timeout)
+        return session
 
 def get_session_manager() -> SessionManager:
     return SessionManager()

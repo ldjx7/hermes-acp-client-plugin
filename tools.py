@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 initialize_workers()
 
 # 全局配置
-DEFAULT_TIMEOUT = 120.0
+DEFAULT_TIMEOUT = 300.0  # 从 120 改为 300 秒
 DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_DELAY = 1.0
+DEFAULT_RETRY_DELAY = 2.0  # 从 1.0 改为 2.0 秒
 
 
 def handle_notification(data):
@@ -165,11 +165,36 @@ def acp_dispatch(task: str, context: dict = None, worker: str = "gemini",
                     continue
                 return json.dumps({"error": error_msg, "status": "failed", "worker": current_worker})
             
-            session_id = resp.get("result", {}).get("sessionId")
+            # 修复：兼容多种 sessionId 提取路径
+            # Gemini ACP 可能返回不同的响应格式
+            session_id = None
+            
+            # 路径 1: 标准 ACP - resp.result.sessionId
+            if not session_id and "result" in resp:
+                session_id = resp["result"].get("sessionId")
+            
+            # 路径 2: Gemini 可能直接返回 sessionId 在 result 中
+            if not session_id and "result" in resp and isinstance(resp["result"], dict):
+                session_id = resp["result"].get("id")  # 某些实现使用 id 而非 sessionId
+            
+            # 路径 3: 某些实现可能直接返回 sessionId 在顶层
             if not session_id:
+                session_id = resp.get("sessionId") or resp.get("id")
+            
+            # 路径 4: 如果还是没有，尝试从 params 中提取（用于通知回调）
+            if not session_id and "params" in resp:
+                session_id = resp["params"].get("sessionId")
+            
+            if not session_id:
+                logger.error(f"Failed to extract sessionId from response: {resp}")
                 if worker_manager:
-                    worker_manager.mark_error(current_worker, "No sessionId", is_rate_limit=False)
-                return json.dumps({"error": "No sessionId in response", "response": resp, "worker": current_worker})
+                    worker_manager.mark_error(current_worker, "No sessionId in response", is_rate_limit=False)
+                return json.dumps({
+                    "error": "No sessionId in response",
+                    "response": resp,
+                    "worker": current_worker,
+                    "response_keys": list(resp.keys()) if isinstance(resp, dict) else None
+                })
             
             # 注册到管理器
             manager.create_session(prompt=task, session_id=session_id)
@@ -384,10 +409,15 @@ def acp_list(active_only: bool = True) -> str:
     """
     try:
         manager = get_session_manager()
-        sessions = manager._sessions if hasattr(manager, '_sessions') else {}
+        
+        # ✅ 使用公开方法 list_sessions()，不直接访问私有属性
+        session_ids = manager.list_sessions()
         
         result = []
-        for session_id, session in sessions.items():
+        for session_id in session_ids:
+            session = manager.get_session(session_id)
+            if not session:
+                continue
             if active_only and session.status not in (SessionStatus.RUNNING, SessionStatus.PENDING):
                 continue
             
@@ -425,17 +455,26 @@ def acp_cleanup(max_age_hours: float = 24.0) -> str:
     """
     try:
         manager = get_session_manager()
-        sessions = manager._sessions if hasattr(manager, '_sessions') else {}
         
         now = datetime.now()
         cleaned = []
         
-        for session_id, session in sessions.items():
-            if session.created_at:
+        # ✅ 使用公开方法 list_sessions()，不直接访问私有属性
+        all_sessions = manager.list_sessions()
+        
+        # 先收集要删除的 ID，再统一删除（避免迭代时修改字典）
+        to_delete = []
+        for session_id in all_sessions:
+            session = manager.get_session(session_id)
+            if session and session.created_at:
                 age = now - session.created_at
                 if age.total_seconds() > max_age_hours * 3600:
-                    manager.delete_session(session_id)
-                    cleaned.append(session_id)
+                    to_delete.append(session_id)
+        
+        # 统一删除
+        for session_id in to_delete:
+            manager.delete_session(session_id)
+            cleaned.append(session_id)
         
         logger.info(f"Cleaned up {len(cleaned)} old sessions")
         
