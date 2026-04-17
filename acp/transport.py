@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Callable, List
 from .protocol import ACPMessage, InitializeRequest, NewSessionRequest, PromptRequest
+from workers.registry import get_worker_adapter, get_worker_adapters
 
 logger = logging.getLogger(__name__)
 
@@ -18,19 +19,16 @@ class WorkerConfig:
     command: List[str]
 
 WORKER_CONFIGS = {
-    "gemini": WorkerConfig("gemini", ["gemini", "--acp"]),
-    "claude": WorkerConfig("claude", ["claude", "--acp"]),
-    "codex": WorkerConfig("codex", ["codex", "--acp"]),
-    "qwen": WorkerConfig("qwen", ["qwen", "--acp"]),
+    name: WorkerConfig(adapter.name, adapter.command)
+    for name, adapter in get_worker_adapters().items()
 }
 
 def get_worker_command(worker_name: str) -> List[str]:
     """Return the command for a given worker name."""
-    config = WORKER_CONFIGS.get(worker_name.lower())
-    if not config:
+    adapter = get_worker_adapter(worker_name)
+    if adapter.name != worker_name.lower():
         logger.warning(f"Unknown worker: {worker_name}, defaulting to gemini")
-        return WORKER_CONFIGS["gemini"].command
-    return config.command
+    return list(adapter.command)
 
 
 class TransportError(Exception):
@@ -322,6 +320,13 @@ def get_transport(worker: str = "gemini", **kwargs) -> StdioTransport:
         if worker not in _transports:
             _transports[worker] = StdioTransport(worker=worker, **kwargs)
         return _transports[worker]
+
+
+def peek_transport(worker: str = "gemini") -> Optional[StdioTransport]:
+    """Return an existing transport without creating a new one."""
+    worker = worker.lower()
+    with _transports_lock:
+        return _transports.get(worker)
 
 def initialize_transport(on_notification=None, worker: str = "gemini", **kwargs) -> bool:
     """Initialize transport for the specified worker."""

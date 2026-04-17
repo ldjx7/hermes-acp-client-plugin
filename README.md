@@ -4,38 +4,32 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Hermes Plugin](https://img.shields.io/badge/Hermes-Plugin-orange.svg)](https://github.com/nousresearch/hermes-agent)
 
-> **让 Hermes Agent 拥有"分身"能力** —— 派发任务到独立的 AI Agent 子会话，实时监听进度，自动回收结果。
+> 让 Hermes Agent 将复杂任务派发到独立 ACP worker，并把状态和结果带回主会话。
 
 ---
 
-## 📖 简介
+## 简介
 
-Hermes ACP Client Plugin 实现了 **ACP (Agent Client Protocol)** 客户端，使 Hermes 能够：
+Hermes ACP Client Plugin 是一个运行在 Hermes 内部的 **ACP (Agent Client Protocol) Client 插件**。它的职责不是自己完成所有任务，而是：
 
-- 🚀 **派发子会话** - 将复杂任务派发到独立的 AI Agent（Gemini/Claude/Codex）
-- 📊 **监听进度** - 实时接收子会话的执行状态和进度更新
-- ✅ **结果回推** - 自动将子会话结果写回父会话
+- 把任务派发到外部 ACP 兼容 worker
+- 跟踪子会话执行状态
+- 将结果、错误和进度回传给 Hermes
+- 在 Hermes 下一次 LLM 调用前自动注入活跃任务摘要
 
-### 为什么需要 ACP？
+当前代码已经完成一轮内部重构，核心结构为：
 
-| 场景 | 传统方式 | ACP 方式 |
-|------|----------|----------|
-| 复杂代码生成 | 单次请求，上下文有限 | 子会话独立处理，1M+ 上下文 |
-| 代码审查 | 占用主会话 token | 子会话完成，主会话继续其他任务 |
-| 多步骤任务 | 顺序执行，耗时长 | 并行派发，异步回收 |
+- `tools.py`：Hermes 工具薄入口
+- `services/`：派发、进度、结果服务
+- `repositories/`：会话状态仓库抽象
+- `workers/`：worker adapter 与能力注册表
+- `acp/`：协议、transport、session manager、hook
 
-### Worker 性能对比
-
-| Worker | 成功率 | 平均耗时 | 推荐场景 |
-|--------|--------|----------|----------|
-| **Gemini CLI** | 100% (5/5) | 28.78s | 代码生成、审查、算法 |
-| Qwen CLI | 20% (1/5) | 244s+ | 简单任务（需 300s+ 超时） |
-| Claude | 待测试 | - | - |
-| Codex | 待测试 | - | - |
+详细实现说明见 [docs/ACP_CLIENT_PLUGIN_PROPOSAL.md](docs/ACP_CLIENT_PLUGIN_PROPOSAL.md)。
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### 安装
 
@@ -57,151 +51,151 @@ ln -s $(pwd) ~/.hermes/plugins/acp-client
 /acp_dispatch --task "写一个 FastAPI 用户认证模块" --worker gemini
 
 # 2. 查询进度
-/acp_progress --session-id abc123
+/acp_progress --task-id abc123
 
 # 3. 获取结果
-/acp_result --session-id abc123
+/acp_result --task-id abc123
+
+# 4. 取消任务
+/acp_cancel --task-id abc123
 ```
 
-### 完整工作流
+`task_id` 传入的就是 `acp_dispatch` 返回的 `sessionId`。
 
-```
-用户请求 → Hermes → acp_dispatch → Gemini 子会话
-                              ↓
-                          执行任务 (代码生成/审查/分析)
-                              ↓
-                          实时进度更新 ← acp_progress
-                              ↓
-                          完成 → acp_result → 返回给 Hermes
+---
+
+## 当前运行逻辑
+
+```text
+Hermes
+└─ acp_dispatch
+   └─ DispatchService
+      ├─ initialize transport
+      ├─ create ACP session
+      ├─ send prompt to worker
+      └─ write session state
+
+worker notifications
+└─ DispatchService.handle_notification
+   └─ repository.update_session
+
+Hermes follow-up calls
+├─ acp_progress -> ProgressService
+├─ acp_result   -> ResultService
+└─ acp_cancel   -> ResultService
+
+before next LLM call
+└─ pre_llm_call_hook
+   └─ inject active ACP progress summary
 ```
 
 ---
 
-## 📁 项目结构
+## 项目结构
 
-```
+```text
 hermes-acp-client-plugin/
-├── acp/                          # 核心 ACP 模块
-│   ├── __init__.py
-│   ├── protocol.py               # ACP 协议消息 (JSON-RPC 2.0)
-│   ├── session_manager.py        # 会话生命周期管理
-│   └── transport.py              # Stdio 传输层
-├── docs/                         # 文档
-│   ├── WORKER_COMPARISON.md      # Worker 性能对比
-│   ├── ACP_ERROR_HANDLING.md     # 错误处理指南
-│   └── QWEN_ADVANCED_TEST.md     # Qwen 兼容性报告
-├── tests/                        # 测试套件
-│   ├── test_gemini_acp.py        # Gemini ACP 测试
-│   ├── test_qwen_acp.py          # Qwen ACP 测试
-│   └── test_advanced_v2.py       # 高级任务测试
-├── tools.py                      # Hermes 工具定义
-├── schemas.py                    # 工具参数 Schema
-├── plugin.yaml                   # 插件配置
-├── README.md                     # 本文件
-└── requirements.txt              # 依赖
+├── plugin.yaml
+├── __init__.py
+├── schemas.py
+├── tools.py
+├── README.md
+├── requirements.txt
+├── src/
+│   └── main.py
+├── acp/
+│   ├── protocol.py
+│   ├── transport.py
+│   ├── session_manager.py
+│   └── hooks.py
+├── services/
+│   ├── dispatch_service.py
+│   ├── progress_service.py
+│   └── result_service.py
+├── repositories/
+│   ├── session_repository.py
+│   └── memory_session_repository.py
+├── workers/
+│   ├── base.py
+│   └── registry.py
+└── docs/
+    ├── ACP_CLIENT_PLUGIN_PROPOSAL.md
+    ├── ACP_ERROR_HANDLING.md
+    └── WORKER_COMPARISON.md
 ```
 
 ---
 
-## 🛠️ 核心工具
+## 核心工具
 
 | 工具 | 功能 | 参数 |
 |------|------|------|
-| `acp_dispatch` | 派发任务到 ACP worker | `task`, `worker`, `timeout` |
-| `acp_progress` | 查询任务进度 | `session_id` |
-| `acp_result` | 获取最终结果 | `session_id` |
-
-### 工具调用示例
-
-```yaml
-# acp_dispatch
-action: acp_dispatch
-args:
-  task: "实现一个二分查找算法，包含类型注解和单元测试"
-  worker: gemini
-  timeout: 120
-
-# acp_progress
-action: acp_progress
-args:
-  session_id: "08433c12-097b-4091-b467-a480fffb700e"
-
-# acp_result
-action: acp_result
-args:
-  session_id: "08433c12-097b-4091-b467-a480fffb700e"
-```
+| `acp_dispatch` | 派发任务到 ACP worker | `task`, `worker`, `timeout`, `max_retries` |
+| `acp_progress` | 查询任务进度 | `task_id` |
+| `acp_result` | 获取最终结果 | `task_id`, `wait`, `timeout` |
+| `acp_cancel` | 取消任务并尽量向 worker 传播取消 | `task_id` |
+| `acp_list` | 列出会话 | `active_only` |
+| `acp_cleanup` | 清理过期会话 | `max_age_hours` |
+| `acp_shutdown` | 关闭一个或全部 worker transport | `worker` |
 
 ---
 
-## 📊 测试结果
-
-### Gemini ACP 测试 (5/5 成功)
-
-| 测试项目 | 结果 | 耗时 |
-|----------|------|------|
-| 代码生成 (email_validator) | ✅ | 84.01s |
-| 代码审查 (security) | ✅ | 15.86s |
-| 算法实现 (binary_search) | ✅ | 16.75s |
-| 简单对话 (hello) | ✅ | 17.88s |
-| 文件操作 (read_file) | ✅ | 9.38s |
-
-**总计**: 5/5 成功 | 平均耗时: 28.78s
-
-详细报告：[docs/WORKER_COMPARISON.md](docs/WORKER_COMPARISON.md)
-
----
-
-## 🔧 配置
+## 配置
 
 ### plugin.yaml
 
 ```yaml
 name: acp-client
-version: 1.0.0
-description: ACP (Agent Client Protocol) client for Hermes Agent
-author: Hermes Agent
-tools:
+version: 0.2.1
+description: ACP client for dispatching tasks to AI workers (Gemini/Claude/Codex/Qwen)
+provides_tools:
   - acp_dispatch
   - acp_progress
   - acp_result
-dependencies:
-  - python >= 3.9
+  - acp_cancel
+  - acp_list
+  - acp_cleanup
+  - acp_shutdown
+hooks:
+  pre_llm_call: acp.hooks.pre_llm_call_hook
 ```
 
 ### Worker 配置
 
-在 `acp/transport.py` 中配置 Worker：
+当前 worker 命令和能力通过 `workers/registry.py` 管理，`acp/transport.py` 从注册表读取命令：
 
 ```python
-WORKER_CONFIGS = {
-    "gemini": {"cmd": "gemini", "args": ["--acp"]},
-    "qwen": {"cmd": "qwen", "args": ["--acp", "--dangerously-skip-permissions"]},
-    "claude": {"cmd": "claude", "args": ["--acp", "--stdio"]},
-    "codex": {"cmd": "codex", "args": ["--acp"]},
+_WORKER_ADAPTERS = {
+    "gemini": WorkerAdapter(name="gemini", command=["gemini", "--acp"]),
+    "qwen": WorkerAdapter(name="qwen", command=["qwen", "--acp"]),
+    "claude": WorkerAdapter(name="claude", command=["claude", "--acp"]),
+    "codex": WorkerAdapter(name="codex", command=["codex", "--acp"]),
 }
 ```
 
 ---
 
-## 🧪 运行测试
+## 当前边界
 
-```bash
-# Gemini ACP 测试
-python3 tests/test_gemini_acp.py
+当前实现已经能表达完整主链路，但仍有这些工程边界：
 
-# Qwen ACP 测试
-python3 tests/test_qwen_acp.py
-
-# 高级任务测试
-python3 tests/test_advanced_v2.py
-```
-
-测试输出保存在 `tests/output/` 目录。
+- session 状态仍然是内存态，进程重启后不会恢复
+- cancel 仍是 best-effort，不保证远程 worker 一定终止
+- 同步 result 和异步 notification 仍是两条并存路径
+- 当前仓库不保留 committed `tests/` 目录
 
 ---
 
-## 📝 开发路线图
+## 推荐下一步
+
+- 增加持久化 repository，例如 SQLite
+- 统一“直接返回结果”和“通知完成”两条状态归并路径
+- 扩展 worker adapter 能力模型
+- 重新建立正式自动化测试策略
+
+---
+
+## 开发路线图
 
 | 阶段 | 状态 | 完成日期 |
 |------|------|----------|
@@ -209,26 +203,27 @@ python3 tests/test_advanced_v2.py
 | Phase 2: ACP 协议 + 会话管理 | ✅ 已完成 | 2026-04-13 |
 | Phase 3: 进度监听 + 结果回推 | ✅ 已完成 | 2026-04-14 |
 | Phase 4: 错误处理 + 日志 | ✅ 已完成 | 2026-04-14 |
-| Phase 5: 测试 + 文档 | ✅ 已完成 | 2026-04-14 |
-| Phase 6: Claude/Codex 支持 | 📋 待开始 | - |
+| Phase 5: Service / Repository / Worker Adapter 重构 | ✅ 已完成 | 2026-04-17 |
+| Phase 6: 持久化与统一事件模型 | 📋 待开始 | - |
 
 ---
 
-## 🔗 参考资源
+## 参考资源
 
 - [Hermes Plugin 开发指南](https://hermes-agent.nousresearch.com/docs/developer-guide/build-a-hermes-plugin)
 - [Agent Client Protocol Spec](https://github.com/agent-client-protocol)
 - [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - [Qwen CLI](https://github.com/QwenLM/qwen-cli)
+- [技术方案文档](docs/ACP_CLIENT_PLUGIN_PROPOSAL.md)
 
 ---
 
-## 📄 许可证
+## 许可证
 
 MIT License - 详见 [LICENSE](LICENSE) 文件
 
 ---
 
 **创建日期**: 2026-04-13  
-**最后更新**: 2026-04-14  
-**版本**: 1.0.0
+**最后更新**: 2026-04-17  
+**版本**: 0.2.1

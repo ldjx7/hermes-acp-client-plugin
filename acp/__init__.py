@@ -15,6 +15,7 @@ Usage:
 from .transport import (
     StdioTransport,
     get_transport,
+    peek_transport,
     initialize_transport,
     shutdown_transport,
     get_worker_command,
@@ -46,11 +47,12 @@ from .hooks import (
     register_hooks,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     # Transport
     "StdioTransport",
     "get_transport",
+    "peek_transport",
     "initialize_transport",
     "shutdown_transport",
     "get_worker_command",

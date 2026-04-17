@@ -1,558 +1,637 @@
-# Hermes ACP Client Plugin - 调研与技术方案
+# Hermes ACP Client Plugin - 当前实现与演进技术方案
 
 ## 文档信息
 
 | 项目 | 内容 |
 |------|------|
 | **项目名称** | hermes-acp-client-plugin |
-| **版本** | 0.1.0 |
-| **创建日期** | 2026-04-13 |
-| **作者** | Hermes Agent Team |
-| **状态** | 技术方案/待开发 |
+| **当前版本** | 0.2.1 |
+| **文档类型** | 实现说明 + 演进方案 |
+| **最后更新** | 2026-04-17 |
+| **状态** | 已实现基础架构，待继续增强 |
 
 ---
 
-## 1. 执行摘要
+## 1. 文档目标
 
-### 1.1 项目目标
+这份文档不再描述“从零开始如何设计一个 ACP Client 插件”，而是基于当前代码库的真实实现，回答 3 个问题：
 
-开发一个 Hermes Agent 插件，实现 **ACP (Agent Client Protocol) 客户端** 功能，使 Hermes 能够：
+1. 当前项目已经实现了什么
+2. 当前运行逻辑是如何串起来的
+3. 下一步应该沿什么方向继续修正和演进
 
-1. **派发子会话** - 将任务派发到独立的 ACP 工作会话（Codex、Claude 等）
-2. **监听进度** - 实时接收子会话的执行进度和状态更新
-3. **结果回推** - 将子会话结果自动写回父会话
+本文档以代码库当前结构为准，重点覆盖：
 
-### 1.2 核心价值
-
-| 当前限制 | 插件解决后 |
-|----------|------------|
-| 单会话执行，长任务阻塞主对话 | 多会话并行，主会话可继续其他工作 |
-| 无法追踪子任务进度 | 实时进度更新，透明化执行过程 |
-| 手动整合多个 agent 输出 | 自动结果回推，统一工作流 |
-
----
-
-## 2. 背景调研
-
-### 2.1 ACP 协议概述
-
-**ACP (Agent Client Protocol)** 是一个标准化的 AI Agent 通信协议，定义了：
-
-- Agent 与 Client 之间的 JSON-RPC 消息格式
-- 会话管理（创建、恢复、终止）
-- 工具调用和进度通知
-- 认证和权限管理
-
-**协议版本**: `PROTOCOL_VERSION` (当前 Hermes 使用 `use_unstable_protocol=True`)
-
-### 2.2 Hermes 现有 ACP 实现
-
-Hermes 当前实现了 **ACP Server** 模式：
-
-```
-┌─────────────┐         ┌─────────────┐
-│   Editor    │  ACP    │   Hermes    │
-│  (VS Code)  │ ──────> │  (ACP Server)│
-│   Client    │  JSON   │  acp.Agent  │
-│             │  -RPC   │             │
-└─────────────┘         └─────────────┘
-```
-
-**关键文件**:
-- `acp_adapter/entry.py` - ACP 入口点
-- `acp_adapter/server.py` - `HermesACPAgent` 实现
-- `acp_adapter/session.py` - 会话管理器
-- `acp_adapter/events.py` - 事件回调处理
-
-### 2.3 acp 包分析
-
-```python
-# acp 包位置
-/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages/acp/__init__.py
-
-# 核心类
-acp.Agent          # Agent 基类
-acp.Client         # Client 连接
-acp.run_agent()    # 运行 Agent 的入口
-
-# 核心消息类型
-acp.InitializeRequest/Response
-acp.NewSessionRequest/Response
-acp.PromptRequest/Response
-acp.SessionNotification
-```
-
-### 2.4 与 OpenClaw 的对比
-
-| 特性 | OpenClaw ACP | Hermes ACP (当前) | 本插件目标 |
-|------|-------------|------------------|------------|
-| **角色** | Client | Server | Client |
-| **子会话派发** | ✓ | ✗ | ✓ |
-| **进度监听** | ✓ (bridge) | ✗ | ✓ |
-| **结果回推** | ✓ (bridge) | ✗ | ✓ |
-| **多 worker 支持** | Codex | IDE | Gemini CLI (stdio) |
-
-### 2.5 Gemini CLI 作为首选 Worker
-
-**为什么选择 Gemini CLI**:
-- **1M+ tokens 上下文** - 可处理大型代码库
-- **原生代码能力** - 文件读写、搜索、Shell 执行
-- **ACP 兼容** - 支持 `--acp-server` 模式作为 stdio worker
-- **无需额外认证** - 复用现有 Google 凭据
-
-**Gemini CLI 启动模式**:
-```bash
-gemini --acp-server  # 作为 ACP worker 运行
-gemini -p "task" -y  # 非交互模式（备选方案）
-```
+- Hermes 插件入口与工具注册
+- ACP 消息协议与 stdio 传输
+- 会话状态管理
+- Service / Repository / Worker Adapter 分层
+- 已知设计边界
+- 推荐修正方向
 
 ---
 
-## 3. 技术方案
+## 2. 项目定位
 
-### 3.1 插件架构
+Hermes ACP Client Plugin 是一个运行在 Hermes 内部的 **ACP Client 插件**。
 
+它的职责不是充当最终的 AI Agent，而是：
+
+- 从 Hermes 接收任务
+- 将任务派发到外部 ACP 兼容 worker
+- 跟踪子会话的状态变化
+- 将进度和结果回传给 Hermes
+
+当前支持的 worker 注册表包含：
+
+- `gemini`
+- `claude`
+- `codex`
+- `qwen`
+
+这些 worker 通过 `stdio + JSON-RPC 2.0` 形式接入。
+
+---
+
+## 3. 当前实现总览
+
+### 3.1 运行时分层
+
+当前项目已经从“工具函数直接编排一切”的结构，重构为更清晰的 6 层：
+
+```text
+Hermes
+└─ Plugin Entry
+   ├─ plugin.yaml
+   └─ __init__.py
+      └─ register(ctx)
+         └─ 注册 tools + schemas + hook
+
+Tool Layer
+└─ tools.py
+   └─ 薄入口，只负责把调用转发给 services
+
+Service Layer
+├─ services/dispatch_service.py
+├─ services/progress_service.py
+└─ services/result_service.py
+
+Repository Layer
+├─ repositories/session_repository.py
+└─ repositories/memory_session_repository.py
+
+Worker Adapter Layer
+├─ workers/base.py
+└─ workers/registry.py
+
+ACP Infrastructure Layer
+├─ acp/protocol.py
+├─ acp/transport.py
+├─ acp/session_manager.py
+└─ acp/hooks.py
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Hermes Agent                            │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              acp-client 插件                         │    │
-│  │  ┌───────────┐  ┌───────────┐  ┌───────────────┐   │    │
-│  │  │  工具层   │  │  事件层   │  │  连接管理层   │   │    │
-│  │  │  Tools    │  │  Events   │  │  Connection   │   │    │
-│  │  └───────────┘  └───────────┘  └───────────────┘   │    │
-│  └─────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-         │
-         │ ACP JSON-RPC (stdio)
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   ACP Workers                                │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │              Gemini CLI (首选)                       │    │
-│  │  - 1M+ tokens 上下文                                 │    │
-│  │  - 原生代码工具链                                     │    │
-│  │  - stdio 模式                                        │    │
-│  └─────────────────────────────────────────────────────┘    │
-│  ┌───────────┐  ┌───────────┐                               │
-│  │  Codex    │  │  Claude   │  (备选)                       │
-│  └───────────┘  └───────────┘                               │
-└─────────────────────────────────────────────────────────────┘
-```
 
-### 3.2 插件目录结构
+### 3.2 各层职责
 
-```
-~/.hermes/plugins/acp-client/
-├── plugin.yaml              # 插件清单
-├── __init__.py              # 注册入口
-├── schemas.py               # 工具 Schema 定义
-├── tools.py                 # 工具实现
-├── hooks.py                 # 生命周期钩子
+| 层级 | 文件 | 职责 |
+|------|------|------|
+| 插件入口层 | `plugin.yaml`, `__init__.py`, `schemas.py` | 声明插件、注册工具和参数契约 |
+| 工具层 | `tools.py` | Hermes 调用入口，保持轻量，不承载复杂业务逻辑 |
+| 服务层 | `services/*.py` | 负责编排派发、查询、取消、清理等核心流程 |
+| 仓库层 | `repositories/*.py` | 抽象 session 状态读写，当前落在内存实现 |
+| Worker 适配层 | `workers/*.py` | 封装 worker 命令和能力信息 |
+| ACP 基础设施层 | `acp/*.py` | 协议消息、传输、会话状态机、hook 注入 |
+
+---
+
+## 4. 当前目录结构
+
+```text
+hermes-acp-client-plugin/
+├── plugin.yaml
+├── __init__.py
+├── schemas.py
+├── tools.py
+├── README.md
+├── requirements.txt
+├── src/
+│   └── main.py
 ├── acp/
 │   ├── __init__.py
-│   ├── client.py            # ACP 客户端连接
-│   ├── session.py           # 子会话管理
-│   └── events.py            # 事件监听
-└── skill.md                 # 捆绑技能文档
-```
-
-### 3.3 核心工具设计
-
-#### 3.3.1 `acp_dispatch` - 派发任务
-
-**Schema**:
-```python
-{
-    "name": "acp_dispatch",
-    "description": (
-        "Dispatch a task to an ACP worker agent (Codex, Claude, etc.). "
-        "Use this when you need to delegate a self-contained coding or research task "
-        "to a separate agent session. The task runs asynchronously and you can track "
-        "progress with acp_progress."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "task": {
-                "type": "string",
-                "description": "The task description to dispatch"
-            },
-            "worker": {
-                "type": "string",
-                "description": "Target worker type (codex, claude, opencode, custom)",
-                "enum": ["codex", "claude", "opencode", "custom"]
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Max execution time in seconds (default: 600)"
-            },
-            "priority": {
-                "type": "string",
-                "description": "Task priority",
-                "enum": ["low", "normal", "high"]
-            }
-        },
-        "required": ["task", "worker"]
-    }
-}
-```
-
-**Handler**:
-```python
-def acp_dispatch(args: dict, **kwargs) -> str:
-    """Dispatch a task to an ACP worker."""
-    from acp.client import ACPClient
-    
-    task = args.get("task")
-    worker = args.get("worker", "codex")
-    timeout = args.get("timeout", 600)
-    
-    client = ACPClient.get_instance()
-    session_id = client.create_session(worker=worker)
-    client.send_prompt(session_id, task)
-    
-    return json.dumps({
-        "session_id": session_id,
-        "status": "dispatched",
-        "worker": worker,
-        "estimated_time": timeout
-    })
-```
-
-#### 3.3.2 `acp_progress` - 查询进度
-
-**Schema**:
-```python
-{
-    "name": "acp_progress",
-    "description": (
-        "Query the progress of a dispatched ACP task. Returns current status, "
-        "progress percentage, and any intermediate results or logs."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "The session ID from acp_dispatch"
-            }
-        },
-        "required": ["session_id"]
-    }
-}
-```
-
-#### 3.3.3 `acp_result` - 获取结果
-
-**Schema**:
-```python
-{
-    "name": "acp_result",
-    "description": (
-        "Get the final result of a completed ACP task. Blocks until completion "
-        "if the task is still running."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "string",
-                "description": "The session ID from acp_dispatch"
-            },
-            "wait": {
-                "type": "boolean",
-                "description": "Whether to wait for completion (default: true)"
-            }
-        },
-        "required": ["session_id"]
-    }
-}
-```
-
-### 3.4 事件钩子设计
-
-#### 3.4.1 `post_llm_call` - 自动派发
-
-```python
-def on_post_llm_call(session_id, assistant_response, **kwargs):
-    """
-    检测 assistant 回复中的派发意图，自动创建 ACP 子会话。
-    
-    触发条件：
-    - 回复包含 "dispatch to codex" 或类似关键词
-    - 回复包含 ACP 派发标记
-    """
-    if should_dispatch(assistant_response):
-        task = extract_task(assistant_response)
-        # 自动派发逻辑
-```
-
-#### 3.4.2 `pre_tool_call` - 进度注入
-
-```python
-def on_pre_tool_call(tool_name, args, task_id, **kwargs):
-    """
-    在每次工具调用前，检查是否有 ACP 进度更新需要注入。
-    """
-    updates = ACPClient.get_pending_updates(task_id)
-    if updates:
-        # 将进度注入到上下文
-        return {"context": format_progress(updates)}
-```
-
-### 3.5 ACP 客户端实现
-
-```python
-# acp/client.py
-import asyncio
-import json
-import logging
-from typing import Dict, Optional, Callable
-import acp
-
-logger = logging.getLogger(__name__)
-
-class ACPClient:
-    """ACP Client for managing sub-sessions."""
-    
-    _instance: Optional['ACPClient'] = None
-    
-    @classmethod
-    def get_instance(cls) -> 'ACPClient':
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    def __init__(self):
-        self._sessions: Dict[str, SessionState] = {}
-        self._conn: Optional[acp.Client] = None
-        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
-        
-    def connect(self, worker: str = "codex") -> None:
-        """Connect to an ACP worker."""
-        # 根据 worker 类型建立连接
-        # codex: stdio
-        # claude: stdio 或 SSE
-        pass
-    
-    def create_session(self, worker: str) -> str:
-        """Create a new ACP sub-session."""
-        session_id = str(uuid.uuid4())
-        # 发送 NewSessionRequest
-        # 记录会话状态
-        return session_id
-    
-    def send_prompt(self, session_id: str, prompt: str) -> None:
-        """Send a prompt to an ACP session."""
-        # 发送 PromptRequest
-        pass
-    
-    def subscribe_progress(self, session_id: str, callback: Callable) -> None:
-        """Subscribe to progress updates from a session."""
-        # 注册进度回调
-        pass
-```
-
----
-
-## 4. 实现路线图
-
-### 4.1 阶段划分
-
-| 阶段 | 目标 | 预计工时 |
-|------|------|----------|
-| **Phase 1** | 基础框架 + `acp_dispatch` 工具 | 2-3 天 |
-| **Phase 2** | 进度监听 + `acp_progress` 工具 | 2-3 天 |
-| **Phase 3** | 结果回推 + 自动注入 | 2-3 天 |
-| **Phase 4** | 多 worker 支持 + 错误处理 | 2-3 天 |
-| **Phase 5** | 测试 + 文档 + 技能捆绑 | 1-2 天 |
-
-**总预计**: 9-14 天
-
-### 4.2 Phase 1 详细任务（修正版：Gemini CLI 优先）
-
-```
-Week 1:
-├── Day 1: 插件骨架创建
-│   ├── plugin.yaml (requires_env: GOOGLE_API_KEY)
+│   ├── protocol.py
+│   ├── transport.py
+│   ├── session_manager.py
+│   └── hooks.py
+├── services/
 │   ├── __init__.py
-│   └── 基础目录结构
-├── Day 2: StdioTransport 实现
-│   ├── acp/transport.py
-│   ├── Gemini CLI 进程管理
-│   └── stdio 读写/错误捕获
-├── Day 3: acp_dispatch 工具
-│   ├── schemas.py (Schema 定义)
-│   ├── tools.py (Handler 实现)
-│   └── initialize/new_session/prompt 流程
-└── Day 4: 冒烟测试
-    ├── 测试脚本
-    ├── 验证 Gemini CLI 进程拉起
-    └── 验证 ACP 响应流
-```
-
-### 4.3 关键里程碑
-
-1. **M1**: 能够成功派发任务到 Codex ACP
-2. **M2**: 能够接收进度通知
-3. **M3**: 完整工作流：派发→进度→结果→回推
-4. **M4**: 插件发布到 Hermes Skills Hub
-
----
-
-## 5. 技术挑战与解决方案
-
-### 5.1 挑战 1: ACP 协议稳定性
-
-**问题**: Hermes 使用 `use_unstable_protocol=True`，协议可能变化
-
-**解决方案**:
-- 使用 Hermes 内置的 `acp` 包，保持版本同步
-- 在 `plugin.yaml` 中声明 Hermes 版本依赖
-- 实现协议版本检测
-
-### 5.2 挑战 2: 异步事件处理
-
-**问题**: ACP 事件流是异步的，需要在同步工具中处理
-
-**解决方案**:
-- 使用 `asyncio` 事件循环
-- 实现事件队列 + 轮询机制
-- 工具返回后立即开始后台监听
-
-### 5.3 挑战 3: 多 worker 认证
-
-**问题**: 不同 worker (Codex, Claude) 需要不同认证
-
-**解决方案**:
-- 使用 Hermes 的 `requires_env` 门控
-- 每个 worker 独立的认证配置
-- 认证状态缓存
-
----
-
-## 6. 测试策略
-
-### 6.1 单元测试
-
-```python
-# tests/test_acp_client.py
-def test_acp_dispatch():
-    """测试任务派发功能"""
-    result = acp_dispatch({"task": "test", "worker": "codex"})
-    data = json.loads(result)
-    assert data["status"] == "dispatched"
-    assert "session_id" in data
-
-def test_acp_progress():
-    """测试进度查询功能"""
-    # Mock ACP 会话
-    pass
-```
-
-### 6.2 集成测试
-
-```python
-# tests/test_integration.py
-def test_full_workflow():
-    """测试完整工作流：派发→进度→结果"""
-    # 实际连接 ACP worker
-    # 验证端到端流程
-    pass
-```
-
-### 6.3 手动测试场景
-
-1. 派发一个简单的代码生成任务
-2. 查询进度（多次）
-3. 获取最终结果
-4. 验证结果写回父会话
-
----
-
-## 7. 配置示例
-
-### 7.1 plugin.yaml
-
-```yaml
-name: acp-client
-version: 0.1.0
-description: ACP client for dispatching tasks to Gemini CLI worker
-author: Hermes Agent Team
-provides_tools:
-  - acp_dispatch
-  - acp_progress
-  - acp_result
-provides_hooks:
-  - post_llm_call
-  - pre_tool_call
-requires_env:
-  - name: GOOGLE_API_KEY
-    description: "Google API key for Gemini CLI"
-    url: "https://aistudio.google.com/app/apikey"
-    secret: true
-  - name: GEMINI_CLI_PATH
-    description: "Path to gemini CLI binary (default: 'gemini')"
-    default: "gemini"
-```
-
-### 7.2 用户使用示例
-
-```python
-# 在 Hermes 会话中
-User: "帮我写一个 FastAPI 用户认证模块"
-
-Assistant: "我将把这个任务派发给 Gemini CLI 来完成。"
-       [调用 acp_dispatch]
-       → {"session_id": "abc123", "status": "dispatched", "worker": "gemini"}
-
-Assistant: "任务已派发 (session: abc123)，Gemini 正在执行中..."
-
-# 5 分钟后
-Assistant: [自动调用 acp_progress]
-           → {"progress": 0.8, "update": "正在编写测试用例"}
-
-Assistant: "当前进度 80%：正在编写测试用例"
-
-# 完成后
-Assistant: [自动调用 acp_result]
-           → {"status": "completed", "result": "..."}
-
-Assistant: "任务完成！以下是生成的代码：..."
+│   ├── dispatch_service.py
+│   ├── progress_service.py
+│   └── result_service.py
+├── repositories/
+│   ├── __init__.py
+│   ├── session_repository.py
+│   └── memory_session_repository.py
+├── workers/
+│   ├── __init__.py
+│   ├── base.py
+│   └── registry.py
+└── docs/
+    ├── ACP_CLIENT_PLUGIN_PROPOSAL.md
+    ├── ACP_ERROR_HANDLING.md
+    ├── WORKER_COMPARISON.md
+    ├── QWEN_ADVANCED_TEST.md
+    └── ...
 ```
 
 ---
 
-## 8. 参考资源
+## 5. 核心运行逻辑
 
-### 8.1 Hermes 内部参考
+### 5.1 启动阶段
 
-- `~/.hermes/hermes-agent/acp_adapter/` - ACP 适配器源码
-- `~/.hermes/hermes-agent/tools/registry.py` - 工具注册机制
-- `~/.hermes/hermes-agent/hermes_cli/plugins.py` - 插件系统
+Hermes 加载插件后：
 
-### 8.2 外部参考
+1. 读取 `plugin.yaml`
+2. 调用根级 `__init__.py:register(ctx)`
+3. 注册 7 个工具：
+   - `acp_dispatch`
+   - `acp_progress`
+   - `acp_result`
+   - `acp_cancel`
+   - `acp_list`
+   - `acp_cleanup`
+   - `acp_shutdown`
+4. 注册 `pre_llm_call_hook`
 
-- [Agent Client Protocol Spec](https://github.com/agent-client-protocol)
-- [Hermes Plugin Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/build-a-hermes-plugin)
-- [OpenClaw ACP Implementation](https://github.com/GalaxyXieyu/openclaw-coding-kit)
-
-### 8.3 相关技能
-
-- `hermes-agent` - Hermes 使用指南
-- `claude-code` - Claude Code 集成
-- `codex` - OpenAI Codex 集成
-
----
-
-## 9. 下一步行动
-
-1. **确认需求** - 与用户确认功能优先级
-2. **环境准备** - 确保 ACP worker 可用
-3. **开始 Phase 1** - 创建插件骨架
-4. **周报复** - 每周五同步进度
+这一步的意义是把 ACP client 能力暴露给 Hermes，同时在每次 LLM 调用前注入活跃任务进度。
 
 ---
 
-*文档版本: 0.1.0 | 最后更新：2026-04-13*
+### 5.2 派发主链路
+
+`acp_dispatch` 的当前调用链如下：
+
+```text
+Hermes
+└─ tools.acp_dispatch(...)
+   └─ DispatchService.dispatch(...)
+      ├─ ensure_initialized(worker)
+      │  └─ initialize_transport(...)
+      │     ├─ get_transport(worker)
+      │     ├─ 启动 stdio 子进程
+      │     └─ 发送 initialize 请求
+      │
+      ├─ transport.create_session()
+      │  └─ 发送 session/new
+      │
+      ├─ repository.create_session(...)
+      │
+      ├─ adapter.build_prompt(...)
+      │
+      ├─ transport.send_prompt(...)
+      │  └─ 发送 session/prompt
+      │
+      └─ 根据响应执行两种路径
+         ├─ 直接 result -> 标记 completed 并写入 result
+         └─ error -> 标记 failed 并写入 error
+```
+
+### 当前行为特点
+
+- `tools.py` 不再直接操作 transport 或 SessionManager
+- `DispatchService` 是派发主链路的唯一编排入口
+- prompt 的构造由 Worker Adapter 负责
+- 状态写回走 Repository 抽象，不直接耦合到 SessionManager 内部字典
+
+---
+
+### 5.3 通知与状态更新
+
+worker 在运行过程中可能通过通知推送状态变化。
+
+当前通知入口为：
+
+```text
+StdioTransport._handle_notification(...)
+└─ DispatchService.handle_notification(data)
+   └─ repository.update_session(...)
+```
+
+当前已显式处理的通知类型有：
+
+- `session/state`
+- `session/log`
+
+对于 `session/state`：
+
+- `idle` -> `pending`
+- `running` -> `running`
+- `completed` -> `completed`
+- `failed` -> `failed`
+- `cancelled` -> `cancelled`
+
+同时还会更新：
+
+- `progress`
+- `progress_message`
+- `result`
+- `error`
+- `started_at`
+- `completed_at`
+
+这意味着系统既支持：
+
+- 同步结果返回
+- 异步通知回推
+
+但二者目前仍是两条并存路径，而不是统一事件模型。
+
+---
+
+### 5.4 查询与回收逻辑
+
+#### `acp_progress`
+
+```text
+tools.acp_progress(task_id)
+└─ ProgressService.get_progress(task_id)
+   └─ repository.get_progress(task_id)
+```
+
+用于返回：
+
+- 状态
+- 当前进度
+- 进度消息
+- 创建时间 / 更新时间
+
+#### `acp_result`
+
+```text
+tools.acp_result(task_id, wait, timeout)
+└─ ResultService.get_result(...)
+   ├─ repository.get_session(task_id)
+   └─ repository.wait_for_completion(task_id, timeout)
+```
+
+会根据终态补充：
+
+- `success`
+- `failure_reason`
+
+#### `acp_cancel`
+
+```text
+tools.acp_cancel(task_id)
+└─ ResultService.cancel(task_id)
+   ├─ repository.get_session(task_id)
+   ├─ peek_transport(worker)
+   ├─ adapter.get_cancel_handler(transport)
+   └─ repository.update_session(... status=cancelled)
+```
+
+当前取消策略是 **best-effort**：
+
+- 如果 worker adapter 暴露了 cancel handler，则尝试远程取消
+- 如果不支持，则返回 `cancellation_scope=local_only`
+- 本地 session 状态始终会标记为 `cancelled`
+
+---
+
+### 5.5 Hook 注入逻辑
+
+`pre_llm_call_hook` 当前负责把“活跃 ACP 任务摘要”插入 Hermes 上下文。
+
+调用链如下：
+
+```text
+Hermes LLM Call
+└─ pre_llm_call_hook(context)
+   └─ ProgressInjector.pre_llm_call(context)
+      ├─ repository.list_sessions()
+      ├─ 选出 running/pending 的 session
+      ├─ 生成摘要消息
+      └─ 注入为 system message
+```
+
+当前实现已经修复了重复堆叠问题：
+
+- 老的 ACP 进度 system message 会被替换
+- 不会在上下文中无限追加重复进度块
+
+---
+
+## 6. 关键设计决策
+
+### 6.1 工具层保持薄入口
+
+这是当前代码里最重要的结构性改进之一。
+
+优点：
+
+- Hermes 对外接口保持稳定
+- 内部重构不会影响工具签名
+- 更容易给 service 层补测试或替换实现
+
+代价：
+
+- service 层数量变多
+- 需要统一 service 之间的边界和共享依赖
+
+---
+
+### 6.2 引入 Repository 抽象
+
+虽然底层仍是 `SessionManager` 内存实现，但 Repository 抽象已经把“状态访问方式”和“状态存储位置”分开了。
+
+这为后续改造成以下实现提供了落点：
+
+- SQLite Repository
+- JSON 文件 Repository
+- Redis Repository
+
+当前价值不在于功能变强，而在于后续演进成本下降。
+
+---
+
+### 6.3 引入 Worker Adapter Registry
+
+当前 worker 命令和能力通过 `workers/registry.py` 管理，而不是散落在多个模块中。
+
+当前 adapter 已承载：
+
+- worker 名称
+- 启动命令
+- 能力声明：
+  - `supports_cancel`
+  - `supports_stream_updates`
+- prompt 构造入口
+- prompt response 规范化入口
+
+这一步虽然还比较轻，但已经是后续兼容多个 CLI 的正确方向。
+
+---
+
+## 7. 当前设计的优点
+
+### 7.1 结构明显比早期方案更清晰
+
+当前实现已经从“一个大工具文件直接处理所有逻辑”，进化为可维护的分层结构。
+
+### 7.2 Hermes 接入点稳定
+
+插件入口和工具签名很薄，后续内部怎么重构，对 Hermes 来说都不需要改接口。
+
+### 7.3 Worker 可扩展性更好
+
+继续接入其他 ACP 兼容 CLI 时，不需要再改 transport 的核心职责，只需补 adapter。
+
+### 7.4 为持久化和恢复留出了接口
+
+虽然还没实现持久化，但 Repository 已经把这个口子开出来了。
+
+---
+
+## 8. 当前设计的边界与问题
+
+### 8.1 Session 仍然是内存态
+
+这是当前最明显的系统边界。
+
+后果：
+
+- 进程重启后 session 全丢
+- 无法恢复历史任务
+- 无法实现真正的跨进程恢复或 crash recovery
+
+影响等级：高。
+
+---
+
+### 8.2 通知模型仍不统一
+
+当前有两条状态完成路径：
+
+1. `session/prompt` 直接返回 result
+2. worker 通过 `session/state` 通知异步完成
+
+这在功能上可用，但在架构上意味着：
+
+- 终态进入系统的来源不统一
+- future streaming / chunk merge / transcript 处理会更复杂
+
+---
+
+### 8.3 cancel 语义仍偏弱
+
+虽然结构上已经支持通过 adapter 探测取消能力，但大多数 worker 当前仍是：
+
+- 本地状态可取消
+- 远程 worker 未必真的被终止
+
+这会带来“UI 显示已取消，但子进程可能还在工作”的语义偏差。
+
+---
+
+### 8.4 transport 的错误处理仍是启发式
+
+当前 stderr JSON 错误解析是为了兼容现有 CLI 行为做的实用方案，但它不是严格协议保证。
+
+潜在风险：
+
+- stderr 输出格式变化会导致错误解析失效
+- stdout / stderr 混杂行为可能随 worker 升级而改变
+
+---
+
+### 8.5 当前仓库不保留 committed tests 目录
+
+目前项目仓库里不再保留 committed `tests/` 目录。
+
+这意味着：
+
+- 文档和实现需要更强调可读性与结构化
+- 若继续推进生产化，应重新建立一套正式的自动化测试策略
+
+这不是立即阻塞项，但属于工程化缺口。
+
+---
+
+## 9. 推荐修正方向
+
+下面按优先级给出建议。
+
+### 9.1 P0：补持久化 Repository
+
+目标：
+
+- 让 session 至少可以跨进程保留
+- 为 crash recovery 和运维可观测性打基础
+
+推荐最小实现：
+
+- 新增 `SqliteSessionRepository`
+- 将当前 `MemorySessionRepository` 保留为默认开发实现
+- 通过配置切换 repository backend
+
+推荐理由：
+
+- 改动集中在 repository 层
+- 不需要推翻现有 service 层
+- 投入小，收益大
+
+---
+
+### 9.2 P0：统一状态事件模型
+
+目标：
+
+- 不再分别处理“同步结果完成”和“异步通知完成”
+- 所有终态都走统一事件写回路径
+
+建议做法：
+
+- 在 `DispatchService` 内增加统一的“状态归并函数”
+- 对 direct result 也包装成内部统一事件对象后再更新 repository
+
+这样后续要接流式 chunk、完整 transcript、token usage 时，不需要再加第三条路径。
+
+---
+
+### 9.3 P1：增强 Worker Adapter
+
+当前 adapter 还比较轻，下一步建议补这些能力：
+
+- `normalize_notification(data)`
+- `extract_progress(data)`
+- `extract_final_result(data)`
+- `supports_resume`
+- `supports_session_restore`
+
+这样可以把 worker 差异继续从 service/transport 中剥离出去。
+
+---
+
+### 9.4 P1：收紧状态机
+
+虽然 `SessionStatus` 已经定义了状态枚举，但状态流转本身还比较宽松。
+
+建议显式限制：
+
+- `pending -> running`
+- `running -> completed`
+- `running -> failed`
+- `running -> cancelled`
+- `pending -> cancelled`
+
+禁止无意义回跳，比如：
+
+- `completed -> running`
+- `failed -> running`
+
+这能减少通知乱序时的状态污染。
+
+---
+
+### 9.5 P2：重新建立正式测试策略
+
+当前更适合做两层测试：
+
+#### 单元测试
+
+覆盖：
+
+- service 层行为
+- repository 语义
+- worker adapter 选择和能力声明
+- hook 注入逻辑
+
+#### 集成测试
+
+覆盖：
+
+- transport 与本地 mock worker 的 JSON-RPC 通信
+- 不直接依赖真实第三方 CLI
+
+这样可以避免把测试体系绑死在外部模型环境上。
+
+---
+
+## 10. 建议演进路线图
+
+### 阶段 A：稳定内核
+
+- 增加持久化 repository
+- 统一状态归并路径
+- 收紧状态机
+
+### 阶段 B：增强多 worker 兼容
+
+- 扩展 worker adapter 能力
+- 明确每个 worker 的能力矩阵
+- 统一 streaming / log / result 提取
+
+### 阶段 C：工程化补齐
+
+- 补单元测试与 mock integration 测试
+- 增加结构化日志
+- 补 session 导出 / 诊断能力
+
+---
+
+## 11. 当前结论
+
+当前项目已经不再是“纯概念方案”。
+
+它已经具备：
+
+- Hermes 插件入口
+- 可用的工具注册
+- ACP 协议消息建模
+- stdio worker 通信
+- 本地 session 管理
+- service / repository / worker adapter 三层结构
+- 进度 hook 注入
+
+从架构判断，它现在处于：
+
+> **基础实现已成型，核心方向正确，但仍需补持久化、统一事件模型和工程化测试，才能走向稳定可维护版本。**
+
+这也是本文档建议的后续修正主线。
+
+---
+
+## 12. 附录：当前主时序图（文本版）
+
+```text
+[Hermes 启动]
+  └─ 读取 plugin.yaml
+      ├─ 注册工具
+      └─ 注册 pre_llm_call_hook
+
+[用户发起任务]
+  └─ Hermes 调用 tools.acp_dispatch(...)
+      └─ DispatchService.dispatch(...)
+          ├─ initialize_transport(...)
+          ├─ create_session()
+          ├─ repository.create_session(...)
+          ├─ adapter.build_prompt(...)
+          ├─ send_prompt(...)
+          └─ 写回 completed / failed / running
+
+[worker 异步通知]
+  └─ StdioTransport._handle_notification(...)
+      └─ DispatchService.handle_notification(...)
+          └─ repository.update_session(...)
+
+[用户查询]
+  ├─ acp_progress -> ProgressService -> repository
+  ├─ acp_result   -> ResultService   -> repository
+  └─ acp_cancel   -> ResultService   -> transport + repository
+
+[Hermes 再次调用 LLM 前]
+  └─ pre_llm_call_hook
+      └─ ProgressInjector
+          └─ repository.list_sessions()
+              └─ 注入系统消息摘要
+```

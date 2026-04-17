@@ -11,7 +11,8 @@ import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 
-from .session_manager import get_session_manager, SessionStatus
+from .session_manager import SessionStatus
+from repositories import get_session_repository
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class ProgressInjector:
     """
     
     def __init__(self):
-        self._manager = get_session_manager()
+        self._repository = get_session_repository()
         self._injected_sessions: Dict[str, datetime] = {}
         self._injection_interval = timedelta(seconds=30)  # 最小注入间隔
         self._max_injected_sessions = 5  # 最多同时注入的会话数
@@ -56,9 +57,9 @@ class ProgressInjector:
     def _get_active_sessions(self) -> List[Dict]:
         """获取正在运行的会话列表"""
         active = []
-        sessions = self._manager._sessions if hasattr(self._manager, '_sessions') else {}
-        
-        for session_id, session in sessions.items():
+
+        for session in self._repository.list_sessions():
+            session_id = session.session_id
             if session.status in (SessionStatus.RUNNING, SessionStatus.PENDING):
                 # 检查是否需要更新（避免过于频繁注入）
                 last_injected = self._injected_sessions.get(session_id)
@@ -118,22 +119,23 @@ class ProgressInjector:
         """注入消息到上下文"""
         if "messages" not in context:
             context["messages"] = []
-        
-        # 检查是否已经注入过（避免重复）
-        messages = context["messages"]
-        if messages:
-            last_msg = messages[-1]
-            if last_msg.get("role") == "system" and "ACP 任务进度" in last_msg.get("content", ""):
-                # 更新现有系统消息
-                last_msg["content"] = message
-                return context
-        
-        # 添加新的系统消息
-        context["messages"].insert(0, {
+
+        # Replace previous ACP progress messages instead of stacking duplicates.
+        messages = [
+            existing
+            for existing in context["messages"]
+            if not (
+                existing.get("role") == "system"
+                and "ACP 任务进度" in existing.get("content", "")
+            )
+        ]
+
+        messages.insert(0, {
             "role": "system",
             "content": message
         })
-        
+
+        context["messages"] = messages
         return context
 
     def clear_injection_history(self):

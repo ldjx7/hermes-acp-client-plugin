@@ -42,7 +42,7 @@ class InitializeRequest(ACPMessage):
     params: Dict[str, Any] = field(default_factory=lambda: {
         "protocolVersion": 1,  # Qwen expects a number, not string
         "capabilities": {},
-        "clientInfo": {"name": "hermes-acp-client-plugin", "version": "0.2.0"}
+        "clientInfo": {"name": "hermes-acp-client-plugin", "version": "0.2.1"}
     })
 
     def __post_init__(self):

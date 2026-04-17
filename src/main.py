@@ -5,7 +5,7 @@ ACP (Agent Client Protocol) 客户端插件，用于派发任务到子会话、
 监听进度、并自动回推结果。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 __author__ = "Hermes Agent Team"
 __status__ = "development"
 
